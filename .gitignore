@@ -1,2 +1,4 @@
-/env
-/market_sample.csv
+__pycache__/
+*.py[cod]
+.env
+.venv

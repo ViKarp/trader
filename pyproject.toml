@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trader-rl"
+version = "0.1.0"
+description = "Multi-asset trading environment and PPO agent for reinforcement learning experiments."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Trader RL"}]
+license = {text = "Proprietary"}
+dependencies = [
+    "gymnasium>=0.28",
+    "numpy>=1.24",
+    "pandas>=1.5",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+trader-rl-demo = "trader_rl.cli.demo:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
