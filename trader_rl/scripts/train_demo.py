@@ -39,6 +39,13 @@ def main() -> None:
         help="Allow overwriting an existing experiment directory.",
     )
     parser.add_argument(
+        "--log-verbosity",
+        type=str,
+        default="all",
+        choices=("all", "updates"),
+        help="Console logging verbosity for experiment progress.",
+    )
+    parser.add_argument(
         "--initial-weights",
         type=Path,
         default=None,
@@ -50,6 +57,7 @@ def main() -> None:
         root_dir=args.experiment_root,
         name=args.experiment_name,
         overwrite=args.overwrite,
+        verbosity=args.log_verbosity,
     )
 
     data_path = "market_sample.csv"

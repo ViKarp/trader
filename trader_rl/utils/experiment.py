@@ -21,11 +21,14 @@ class ExperimentLogger:
     weights as artifacts.
     """
 
+    _VERBOSITY_LEVELS = {"all", "updates"}
+
     def __init__(
         self,
         root_dir: Optional[Path | str] = None,
         name: Optional[str] = None,
         overwrite: bool = False,
+        verbosity: str = "all",
     ) -> None:
         self.root_dir = Path(root_dir or "experiments")
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +61,13 @@ class ExperimentLogger:
         file_handler = logging.FileHandler(self.experiment_dir / "experiment.log", encoding="utf-8")
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
+
+        if verbosity not in self._VERBOSITY_LEVELS:
+            raise ValueError(
+                f"Unsupported verbosity '{verbosity}'. "
+                f"Choose from: {sorted(self._VERBOSITY_LEVELS)}"
+            )
+        self._verbosity = verbosity
 
         self._history: Dict[str, list[float]] = {}
         self._updates: list[int] = []
@@ -122,7 +132,8 @@ class ExperimentLogger:
             f"{prefix}{timestamp} | {symbol} {side} qty={qty:.4f} "
             f"price={price:.4f} pos={position:.4f} target={target:.4f} equity={equity:.2f}"
         )
-        self.logger.info(message)
+        if self._verbosity == "all":
+            self.logger.info(message)
         self._trades.append({k: self._convert(v) for k, v in event.items()})
 
     # ------------------------------------------------------------------
