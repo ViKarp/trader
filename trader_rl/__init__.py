@@ -3,6 +3,7 @@ from .agents import PPOAgent
 from .config import EnvConfig, PPOConfig
 from .data import make_or_load_sample_csv
 from .envs import MultiAssetTradingEnv
+from .utils import ExperimentLogger
 
 __all__ = [
     "PPOAgent",
@@ -10,4 +11,5 @@ __all__ = [
     "PPOConfig",
     "make_or_load_sample_csv",
     "MultiAssetTradingEnv",
+    "ExperimentLogger",
 ]
