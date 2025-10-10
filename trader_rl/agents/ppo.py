@@ -1,7 +1,8 @@
 """Proximal Policy Optimization agent."""
 from __future__ import annotations
 
-from typing import Dict, List
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -10,12 +11,20 @@ import torch.nn as nn
 from trader_rl.config import PPOConfig
 from trader_rl.envs import MultiAssetTradingEnv
 from trader_rl.models import PolicyNet
+from trader_rl.utils import ExperimentLogger
 
 
 class PPOAgent:
     """Lightweight PPO implementation for the trading environment."""
 
-    def __init__(self, env: MultiAssetTradingEnv, cfg: PPOConfig) -> None:
+    def __init__(
+        self,
+        env: MultiAssetTradingEnv,
+        cfg: PPOConfig,
+        *,
+        logger: Optional[ExperimentLogger] = None,
+        initial_weights: Optional[str | Path] = None,
+    ) -> None:
         self.env = env
         obs, _ = env.reset()
         f_time = obs["time"].shape[-1]
@@ -26,6 +35,14 @@ class PPOAgent:
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
         self.cfg = cfg
         self.device = cfg.device
+        self.logger = logger
+
+        self._architecture_signature = self._build_signature(self.model.state_dict().items())
+
+        if initial_weights is not None:
+            self.load_weights(initial_weights)
+            if self.logger:
+                self.logger.log_message(f"Начальные веса загружены из {initial_weights}")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -111,7 +128,16 @@ class PPOAgent:
         disc_t = torch.tensor(np.stack(batch["disc"], axis=0), dtype=torch.int64, device=self.device)
         cont_t = torch.tensor(np.stack(batch["cont"], axis=0), dtype=torch.float32, device=self.device)
         logp_t = torch.tensor(batch["logp"], dtype=torch.float32, device=self.device)
-        return obs_t, disc_t, cont_t, logp_t, values.detach(), returns.detach(), adv.detach()
+        return (
+            obs_t,
+            disc_t,
+            cont_t,
+            logp_t,
+            values.detach(),
+            returns.detach(),
+            adv.detach(),
+            rewards.detach(),
+        )
 
     def update(
         self,
@@ -166,7 +192,99 @@ class PPOAgent:
 
     def train(self, total_updates: int = 50) -> None:
         for update in range(1, total_updates + 1):
-            obs_t, disc_t, cont_t, logp_old, values_old, returns, adv = self.collect_rollout()
+            (
+                obs_t,
+                disc_t,
+                cont_t,
+                logp_old,
+                values_old,
+                returns,
+                adv,
+                rewards,
+            ) = self.collect_rollout()
             self.update(obs_t, disc_t, cont_t, logp_old, values_old, returns, adv)
             eq = self.env.info_last.get("equity", float("nan"))
-            print(f"Update {update:03d}: last_equity={eq:,.2f}")
+            metrics = {
+                "update": update,
+                "equity": float(eq),
+                "reward_sum": float(rewards.sum().item()),
+                "reward_mean": float(rewards.mean().item()),
+                "adv_mean": float(adv.mean().item()),
+                "adv_std": float(adv.std().item()),
+            }
+            if self.logger:
+                self.logger.log_update(metrics)
+            else:
+                print(f"Update {update:03d}: last_equity={eq:,.2f}")
+
+        if self.logger:
+            self.logger.log_message("Обучение завершено")
+
+    # ------------------------------------------------------------------
+    # Weight management helpers
+    def _build_signature(
+        self, params: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
+        signature: List[Tuple[str, Tuple[int, ...]]] = []
+        for name, tensor in params:
+            shape = tuple(int(dim) for dim in tensor.shape)
+            signature.append((name, shape))
+        return tuple(signature)
+
+    def _normalize_signature(
+        self, signature: Sequence[Tuple[str, Sequence[int]]]
+    ) -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
+        normalized: List[Tuple[str, Tuple[int, ...]]] = []
+        for name, shape in signature:
+            normalized.append((str(name), tuple(int(dim) for dim in shape)))
+        return tuple(normalized)
+
+    def save_weights(
+        self,
+        path: str | Path,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state_dict": self.model.state_dict(),
+            "optimizer_state": self.opt.state_dict(),
+            "architecture": list(self._architecture_signature),
+            "metadata": metadata or {},
+        }
+        torch.save(payload, path)
+        if self.logger:
+            self.logger.log_message(f"Веса модели сохранены в {path}")
+        return path
+
+    def load_weights(self, path: str | Path, strict: bool = True) -> None:
+        path = Path(path)
+        checkpoint = torch.load(path, map_location=self.device)
+        architecture = checkpoint.get("architecture")
+        if architecture is None:
+            raise ValueError(
+                f"Файл {path} не содержит сигнатуру архитектуры и не может быть использован"
+            )
+        normalized_arch = self._normalize_signature(architecture)
+        if normalized_arch != self._architecture_signature:
+            raise ValueError(
+                "Сигнатура архитектуры сохранённых весов не совпадает с текущей моделью"
+            )
+
+        state_dict = checkpoint.get("state_dict")
+        if state_dict is None:
+            raise ValueError(f"В файле {path} отсутствует состояние модели")
+        self.model.load_state_dict(state_dict, strict=strict)
+
+        opt_state = checkpoint.get("optimizer_state")
+        if opt_state is not None:
+            try:
+                self.opt.load_state_dict(opt_state)
+            except ValueError:
+                if self.logger:
+                    self.logger.log_message(
+                        "Оптимизатор не удалось инициализировать из сохранённого состояния"
+                    )
+
+        if self.logger:
+            self.logger.log_message(f"Веса модели загружены из {path}")
