@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ class PPOAgent:
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
         self.cfg = cfg
         self.device = cfg.device
+        self._global_step = 0
         self._arch_signature = {
             "model": self.model.__class__.__name__,
             "num_assets": self.N,
@@ -79,6 +80,7 @@ class PPOAgent:
         steps = 0
         episode_returns: List[float] = []
         current_episode_return = 0.0
+        trade_events: List[Dict[str, Any]] = []
 
         while steps < self.cfg.rollout_steps:
             tobs = self._to_torch_obs(obs)
@@ -87,7 +89,7 @@ class PPOAgent:
             disc_np = disc.squeeze(0).cpu().numpy().astype(np.int64)
             cont_np = cont.squeeze(0).cpu().numpy().astype(np.float32)
             action = {"disc": disc_np, "target": cont_np}
-            next_obs, reward, term, trunc, _ = env.step(action)
+            next_obs, reward, term, trunc, info = env.step(action)
 
             batch["obs_time"].append(obs["time"])
             batch["obs_pos"].append(obs["pos"])
@@ -98,6 +100,8 @@ class PPOAgent:
             batch["value"].append(value.item())
             batch["reward"].append(reward)
             batch["done"].append(float(term or trunc))
+
+            trade_events.extend(self._extract_trade_events(info, disc_np, cont_np))
 
             obs = next_obs
             current_episode_return += reward
@@ -155,6 +159,7 @@ class PPOAgent:
             returns.detach(),
             adv.detach(),
             stats,
+            trade_events,
         )
 
     def update(
@@ -229,6 +234,7 @@ class PPOAgent:
         self,
         total_updates: int = 50,
         log_fn: Optional[Callable[[int, Mapping[str, float]], None]] = None,
+        step_log_fn: Optional[Callable[[Mapping[str, Any]], None]] = None,
     ) -> None:
         for update in range(1, total_updates + 1):
             (
@@ -240,15 +246,59 @@ class PPOAgent:
                 returns,
                 adv,
                 rollout_stats,
+                trade_events,
             ) = self.collect_rollout()
             update_stats = self.update(obs_t, disc_t, cont_t, logp_old, values_old, returns, adv)
             eq = float(self.env.info_last.get("equity", float("nan")))
             metrics = {**rollout_stats, **update_stats, "last_equity": eq}
+            if step_log_fn is not None:
+                for event in trade_events:
+                    step_log_fn(event)
             if log_fn is not None:
                 log_fn(update, metrics)
             else:
                 formatted = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
                 print(f"Update {update:03d}: {formatted}")
+
+    def _extract_trade_events(
+        self, info: Mapping[str, Any], disc: np.ndarray, cont: np.ndarray
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        if not info:
+            return events
+        symbols = getattr(self.env, "symbols", [f"asset_{i}" for i in range(self.N)])
+        timestamp = info.get("timestamp")
+        order_qty = np.asarray(info.get("order_qty", np.zeros(self.N)), dtype=float)
+        fill_price = np.asarray(info.get("fill_price", np.zeros(self.N)), dtype=float)
+        position_qty = np.asarray(info.get("position_qty", np.zeros(self.N)), dtype=float)
+        current_frac = np.asarray(info.get("current_fraction", np.zeros(self.N)), dtype=float)
+        post_frac = np.asarray(info.get("post_fraction", np.zeros(self.N)), dtype=float)
+        close = np.asarray(info.get("close", np.zeros(self.N)), dtype=float)
+        equity = float(info.get("equity_after_trade", info.get("equity", float("nan"))))
+
+        for idx, symbol in enumerate(symbols):
+            qty = order_qty[idx] if idx < len(order_qty) else 0.0
+            if np.isclose(qty, 0.0):
+                continue
+            side = "BUY" if qty > 0 else "SELL"
+            event = {
+                "step": self._global_step,
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "side": side,
+                "qty": float(qty),
+                "price": float(fill_price[idx]) if idx < len(fill_price) else float("nan"),
+                "position": float(position_qty[idx]) if idx < len(position_qty) else float("nan"),
+                "target_fraction": float(post_frac[idx]) if idx < len(post_frac) else float("nan"),
+                "previous_fraction": float(current_frac[idx]) if idx < len(current_frac) else float("nan"),
+                "close_price": float(close[idx]) if idx < len(close) else float("nan"),
+                "equity": equity,
+                "disc_action": int(disc[idx]) if idx < len(disc) else int(0),
+                "cont_action": float(cont[idx]) if idx < len(cont) else float("nan"),
+            }
+            events.append(event)
+        self._global_step += 1
+        return events
 
     # ------------------------------------------------------------------
     # Serialization helpers

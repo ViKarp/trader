@@ -280,12 +280,14 @@ class MultiAssetTradingEnv(Env):
     def _mark_to_market(self, price_now: np.ndarray) -> float:
         return float(self.cash + np.sum(self.qty * price_now))
 
-    def _execute(self, disc: np.ndarray, target: np.ndarray) -> Tuple[float, float, float]:
+    def _execute(
+        self,
+        disc: np.ndarray,
+        target: np.ndarray,
+        price: np.ndarray,
+        equity: float,
+    ) -> Tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         t = self.t
-        price = self._midprice(t)
-        equity_before = self._mark_to_market(price)
-        equity = equity_before
-
         desired_frac = target.copy()
         target_notional = desired_frac * equity
         target_qty = np.divide(target_notional, price, out=np.zeros_like(price), where=price > 0)
@@ -326,12 +328,24 @@ class MultiAssetTradingEnv(Env):
         self.cash -= borrow_cost
 
         turnover = float(np.sum(np.abs(order_qty * fill_price)) / max(equity, 1e-12))
+        post_frac = np.divide(self.qty * price, max(equity, 1e-12))
 
         opened_mask = (np.isclose(self.qty - order_qty, 0.0) & (~np.isclose(self.qty, 0.0)))
         self.entry_px[opened_mask] = fill_price[opened_mask]
         self.entry_t[opened_mask] = t
 
-        return float(commissions), float(borrow_cost), turnover
+        equity_after_trade = self._mark_to_market(price)
+
+        return (
+            float(commissions),
+            float(borrow_cost),
+            turnover,
+            order_qty,
+            fill_price,
+            desired_frac,
+            post_frac,
+            equity_after_trade,
+        )
 
     # ------------------------------------------------------------------
     # Gym API
@@ -355,8 +369,18 @@ class MultiAssetTradingEnv(Env):
         current_frac = np.divide(self.qty * price_t, max(equity_t, 1e-12))
         hold_mask = disc == 0
         target[hold_mask] = current_frac[hold_mask]
+        prev_qty = self.qty.copy()
 
-        commissions, borrow_cost, turnover = self._execute(disc, target)
+        (
+            commissions,
+            borrow_cost,
+            turnover,
+            order_qty,
+            fill_price,
+            desired_frac,
+            post_frac,
+            equity_after_trade,
+        ) = self._execute(disc, target, price_t, equity_t)
 
         t_next = self.t + 1
         price_next = self._midprice(t_next)
@@ -376,6 +400,20 @@ class MultiAssetTradingEnv(Env):
             "commissions": commissions,
             "borrow_cost": borrow_cost,
             "turnover": turnover,
+            "timestamp": self.timestamps[self.t - 1].isoformat(),
+            "next_timestamp": self.timestamps[self.t].isoformat(),
+            "close": price_t.tolist(),
+            "next_close": price_next.tolist(),
+            "action_disc": disc.astype(int).tolist(),
+            "target_fraction": desired_frac.tolist(),
+            "post_fraction": post_frac.tolist(),
+            "order_qty": order_qty.tolist(),
+            "fill_price": fill_price.tolist(),
+            "position_qty": self.qty.tolist(),
+            "prev_position_qty": prev_qty.tolist(),
+            "current_fraction": current_frac.tolist(),
+            "equity_before": equity_t,
+            "equity_after_trade": equity_after_trade,
         }
         obs = self._obs() if not self.done_flag else self._obs()
         return obs, float(reward), terminated, truncated, self.info_last
