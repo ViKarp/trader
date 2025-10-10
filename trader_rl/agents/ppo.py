@@ -1,7 +1,8 @@
 """Proximal Policy Optimization agent."""
 from __future__ import annotations
 
-from typing import Dict, List
+from pathlib import Path
+from typing import Callable, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -15,7 +16,12 @@ from trader_rl.models import PolicyNet
 class PPOAgent:
     """Lightweight PPO implementation for the trading environment."""
 
-    def __init__(self, env: MultiAssetTradingEnv, cfg: PPOConfig) -> None:
+    def __init__(
+        self,
+        env: MultiAssetTradingEnv,
+        cfg: PPOConfig,
+        initial_weights: Optional[str | Path] = None,
+    ) -> None:
         self.env = env
         obs, _ = env.reset()
         f_time = obs["time"].shape[-1]
@@ -26,6 +32,16 @@ class PPOAgent:
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
         self.cfg = cfg
         self.device = cfg.device
+        self._arch_signature = {
+            "model": self.model.__class__.__name__,
+            "num_assets": self.N,
+            "time_features": f_time,
+            "position_features": p_in,
+            "global_features": g_in,
+        }
+
+        if initial_weights is not None:
+            self.load_weights(initial_weights)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -61,6 +77,9 @@ class PPOAgent:
             "done": [],
         }
         steps = 0
+        episode_returns: List[float] = []
+        current_episode_return = 0.0
+
         while steps < self.cfg.rollout_steps:
             tobs = self._to_torch_obs(obs)
             with torch.no_grad():
@@ -81,9 +100,15 @@ class PPOAgent:
             batch["done"].append(float(term or trunc))
 
             obs = next_obs
+            current_episode_return += reward
             steps += 1
             if term or trunc:
+                episode_returns.append(current_episode_return)
+                current_episode_return = 0.0
                 obs, _ = env.reset()
+
+        if steps >= self.cfg.rollout_steps and current_episode_return:
+            episode_returns.append(current_episode_return)
 
         b = len(batch["reward"])
         rewards = torch.tensor(batch["reward"], dtype=torch.float32, device=self.device)
@@ -111,7 +136,26 @@ class PPOAgent:
         disc_t = torch.tensor(np.stack(batch["disc"], axis=0), dtype=torch.int64, device=self.device)
         cont_t = torch.tensor(np.stack(batch["cont"], axis=0), dtype=torch.float32, device=self.device)
         logp_t = torch.tensor(batch["logp"], dtype=torch.float32, device=self.device)
-        return obs_t, disc_t, cont_t, logp_t, values.detach(), returns.detach(), adv.detach()
+
+        stats = {
+            "rollout_steps": float(b),
+            "mean_reward": float(rewards.mean().item()),
+            "total_reward": float(rewards.sum().item()),
+            "episodes_completed": float(len(episode_returns)),
+            "mean_episode_reward": float(np.mean(episode_returns))
+            if episode_returns
+            else float("nan"),
+        }
+        return (
+            obs_t,
+            disc_t,
+            cont_t,
+            logp_t,
+            values.detach(),
+            returns.detach(),
+            adv.detach(),
+            stats,
+        )
 
     def update(
         self,
@@ -122,9 +166,13 @@ class PPOAgent:
         values_old: torch.Tensor,
         returns: torch.Tensor,
         advantages: torch.Tensor,
-    ) -> None:
+    ) -> Dict[str, float]:
         b = returns.shape[0]
         idx = np.arange(b)
+        total_pg_loss = 0.0
+        total_v_loss = 0.0
+        total_entropy = 0.0
+        batches = 0
         for _ in range(self.cfg.update_epochs):
             np.random.shuffle(idx)
             for start in range(0, b, self.cfg.minibatch_size):
@@ -163,10 +211,93 @@ class PPOAgent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
                 self.opt.step()
+                total_pg_loss += pg_loss.item()
+                total_v_loss += v_loss.item()
+                total_entropy += ent.item()
+                batches += 1
 
-    def train(self, total_updates: int = 50) -> None:
+        if batches == 0:
+            return {"policy_loss": float("nan"), "value_loss": float("nan"), "entropy": float("nan")}
+
+        return {
+            "policy_loss": total_pg_loss / batches,
+            "value_loss": total_v_loss / batches,
+            "entropy": total_entropy / batches,
+        }
+
+    def train(
+        self,
+        total_updates: int = 50,
+        log_fn: Optional[Callable[[int, Mapping[str, float]], None]] = None,
+    ) -> None:
         for update in range(1, total_updates + 1):
-            obs_t, disc_t, cont_t, logp_old, values_old, returns, adv = self.collect_rollout()
-            self.update(obs_t, disc_t, cont_t, logp_old, values_old, returns, adv)
-            eq = self.env.info_last.get("equity", float("nan"))
-            print(f"Update {update:03d}: last_equity={eq:,.2f}")
+            (
+                obs_t,
+                disc_t,
+                cont_t,
+                logp_old,
+                values_old,
+                returns,
+                adv,
+                rollout_stats,
+            ) = self.collect_rollout()
+            update_stats = self.update(obs_t, disc_t, cont_t, logp_old, values_old, returns, adv)
+            eq = float(self.env.info_last.get("equity", float("nan")))
+            metrics = {**rollout_stats, **update_stats, "last_equity": eq}
+            if log_fn is not None:
+                log_fn(update, metrics)
+            else:
+                formatted = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                print(f"Update {update:03d}: {formatted}")
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    def save_weights(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state_dict": self.model.state_dict(),
+            "architecture": self._arch_signature,
+            "config": {
+                "ppo": self.cfg.__dict__,
+            },
+        }
+        torch.save(payload, target)
+
+    def load_weights(self, path: str | Path) -> None:
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"Weights file '{source}' does not exist")
+        payload = torch.load(source, map_location=self.device)
+        if isinstance(payload, dict) and "state_dict" in payload:
+            state_dict = payload["state_dict"]
+            arch = payload.get("architecture")
+        else:
+            state_dict = payload
+            arch = None
+
+        if arch is not None and arch != self._arch_signature:
+            raise ValueError(
+                "Loaded weights architecture does not match the current model. "
+                f"Expected {self._arch_signature}, got {arch}."
+            )
+
+        self._validate_state_dict(state_dict)
+        self.model.load_state_dict(state_dict)
+
+    def _validate_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
+        model_state = self.model.state_dict()
+        missing = set(model_state.keys()) - set(state_dict.keys())
+        unexpected = set(state_dict.keys()) - set(model_state.keys())
+        if missing or unexpected:
+            raise ValueError(
+                "State dict structure mismatch: "
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            )
+        for key, tensor in model_state.items():
+            other = state_dict[key]
+            if tensor.shape != other.shape:
+                raise ValueError(
+                    f"Tensor shape mismatch for '{key}': expected {tuple(tensor.shape)}, "
+                    f"got {tuple(other.shape)}"
+                )
