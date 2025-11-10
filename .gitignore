@@ -5,3 +5,5 @@ __pycache__/
 env
 market_sample.csv
 .DS_Store
+datasets/
+experiments/
