@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-def make_or_load_sample_csv(path: str, n_symbols: int = 4, bars: int = 6_000) -> pd.DataFrame:
+def make_or_load_sample_csv(path: str, n_symbols: int = 4, bars: int = 60_000) -> pd.DataFrame:
     """Create or load a synthetic OHLCV dataset."""
     if os.path.exists(path):
         return pd.read_csv(path, parse_dates=["timestamp"])
