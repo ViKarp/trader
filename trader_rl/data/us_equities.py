@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -105,14 +105,49 @@ def _normalise_frame(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df[["timestamp", "symbol", *PRICE_COLS, *VOL_COLS]].reset_index(drop=True)
 
 
-def _resample(df: pd.DataFrame, freq: str, fill_method: str) -> pd.DataFrame:
-    df = df.set_index("timestamp").sort_index()
+def _align_to_joint_range(
+    df: pd.DataFrame,
+    joint_index: pd.DatetimeIndex,
+    fill_method: str,
+) -> pd.DataFrame:
+    df = df.set_index(["timestamp", "symbol"]).sort_index()
 
+    def _align_symbol(group: pd.DataFrame) -> pd.DataFrame:
+        symbol = group.index.get_level_values("symbol").unique()[0]
+        values = group.droplevel("symbol").reindex(joint_index).copy()
+        values.index.name = "timestamp"
+
+        if fill_method == "drop":
+            values = values.dropna(subset=PRICE_COLS)
+            values[VOL_COLS] = values[VOL_COLS].fillna(0.0)
+        elif fill_method == "ffill":
+            values[PRICE_COLS] = values[PRICE_COLS].ffill().bfill()
+            values = values.dropna(subset=PRICE_COLS)
+            values[VOL_COLS] = values[VOL_COLS].fillna(0.0)
+        elif fill_method == "bfill":
+            values[PRICE_COLS] = values[PRICE_COLS].bfill().ffill()
+            values = values.dropna(subset=PRICE_COLS)
+            values[VOL_COLS] = values[VOL_COLS].fillna(0.0)
+        else:
+            raise ValueError("fill_method должен быть 'ffill', 'bfill' или 'drop'")
+
+        values["symbol"] = symbol
+        return values.reset_index()
+
+    aligned = df.groupby(level="symbol", group_keys=False).apply(_align_symbol)
+    return aligned.reset_index(drop=True)
+
+
+def _resample_aligned(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     if freq.upper() in ("1D", "D"):
-        full_index = pd.date_range(df.index.min(), df.index.max(), freq="1D", tz="UTC")
-        df = df.reindex(full_index)
-    else:
-        df = df.resample(freq).agg(
+        return df
+
+    df = df.set_index(["timestamp", "symbol"]).sort_index()
+
+    def _resample_symbol(group: pd.DataFrame) -> pd.DataFrame:
+        symbol = group.index.get_level_values("symbol").unique()[0]
+        values = group.droplevel("symbol")
+        resampled = values.resample(freq).agg(
             {
                 "open": "first",
                 "high": "max",
@@ -121,26 +156,13 @@ def _resample(df: pd.DataFrame, freq: str, fill_method: str) -> pd.DataFrame:
                 "volume": "sum",
             }
         )
+        resampled = resampled.dropna(subset=PRICE_COLS)
+        resampled[VOL_COLS] = resampled[VOL_COLS].fillna(0.0)
+        resampled["symbol"] = symbol
+        return resampled.reset_index()
 
-    if fill_method == "ffill":
-        df[PRICE_COLS] = df[PRICE_COLS].ffill().bfill()
-        df[VOL_COLS] = df[VOL_COLS].fillna(0.0)
-    elif fill_method == "drop":
-        df = df.dropna(subset=PRICE_COLS)
-        df[VOL_COLS] = df[VOL_COLS].fillna(0.0)
-    else:
-        raise ValueError("fill_method должен быть 'ffill' или 'drop'")
-
-    df = df.dropna(subset=PRICE_COLS)
-    df[VOL_COLS] = df[VOL_COLS].fillna(0.0)
-
-    mask_finite = np.isfinite(df[PRICE_COLS + VOL_COLS])
-    if not mask_finite.to_numpy().all():
-        df = df[mask_finite.all(axis=1)]
-
-    df.index.name = "timestamp"
-    df = df.reset_index()
-    return df
+    resampled = df.groupby(level="symbol", group_keys=False).apply(_resample_symbol)
+    return resampled.reset_index(drop=True)
 
 
 def _assert_valid_bars(df: pd.DataFrame, symbol: str, stage: str) -> None:
@@ -200,7 +222,7 @@ def load_us_equities(
     freq: str = "1D",
     start: Optional[Union[str, pd.Timestamp]] = None,
     end: Optional[Union[str, pd.Timestamp]] = None,
-    fill_method: str = "ffill",
+    fill_method: str = "bfill",
     min_bars: int = 64,
 ) -> pd.DataFrame:
     """Load a subset of the US equities dataset into a single DataFrame.
@@ -222,9 +244,10 @@ def load_us_equities(
     start, end:
         Optional date boundaries. We keep rows ``start <= timestamp <= end``.
     fill_method:
-        How to handle missing bars after resampling. ``"ffill"`` performs
-        forward/backward filling for prices and replaces missing volume with
-        zeros. ``"drop"`` removes incomplete rows.
+        How to handle missing bars after resampling. ``"bfill"`` (по умолчанию)
+        выполняет обратное заполнение с дополнительным ``ffill`` для внутренних
+        разрывов и заменяет пропуски объема нулями. ``"ffill"`` сохраняет
+        прежнее поведение прямого заполнения, ``"drop"`` удаляет неполные строки.
     min_bars:
         Minimum number of bars required to keep a symbol. This prevents loading
         illiquid assets with extremely short histories.
@@ -241,7 +264,7 @@ def load_us_equities(
         symbols = sorted(path.stem for path in directory.glob("*.txt"))
 
     fill_method = fill_method.lower()
-    frames: List[pd.DataFrame] = []
+    per_symbol: Dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         file_path = _resolve_file(directory, symbol)
         raw = pd.read_csv(file_path)
@@ -257,27 +280,60 @@ def load_us_equities(
 
         if normalised.empty:
             continue
+        per_symbol[symbol] = normalised.assign(symbol=symbol)
 
-        resampled = _resample(normalised, freq=freq, fill_method=fill_method)
-        _assert_valid_bars(resampled, symbol, stage="resample")
-        if len(resampled) < min_bars:
-            continue
-
-        resampled["symbol"] = symbol
-        frames.append(resampled)
-
-    if not frames:
+    if not per_symbol:
         raise ValueError("Не удалось загрузить ни одного символа из датасета")
 
-    combined = pd.concat(frames, axis=0, ignore_index=True)
-    combined = combined.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    active_symbols = list(per_symbol.keys())
 
-    for sym, frame in combined.groupby("symbol", sort=False):
-        _assert_valid_bars(frame.reset_index(drop=True), symbol=sym, stage="final")
+    while True:
+        active_frames = [per_symbol[s] for s in active_symbols]
+        starts = [frame["timestamp"].min() for frame in active_frames]
+        ends = [frame["timestamp"].max() for frame in active_frames]
+
+        joint_start = max(starts)
+        joint_end = min(ends)
+        if pd.isna(joint_start) or pd.isna(joint_end) or joint_start > joint_end:
+            raise ValueError(
+                "Не удалось определить общий временной диапазон для выбранных тикеров"
+            )
+
+        joint_index = pd.date_range(joint_start, joint_end, freq="1D", tz="UTC")
+
+        combined = pd.concat(active_frames, axis=0, ignore_index=True)
+        combined = combined[
+            (combined["timestamp"] >= joint_start) & (combined["timestamp"] <= joint_end)
+        ]
+        combined = combined.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+        aligned = _align_to_joint_range(combined, joint_index=joint_index, fill_method=fill_method)
+        for sym, frame in aligned.groupby("symbol", sort=False):
+            _assert_valid_bars(frame.reset_index(drop=True), symbol=sym, stage="aligned")
+
+        resampled = _resample_aligned(aligned, freq=freq)
+        resampled = resampled.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+        valid_symbols: List[str] = []
+        for sym, frame in resampled.groupby("symbol", sort=False):
+            _assert_valid_bars(frame.reset_index(drop=True), symbol=sym, stage="resample")
+            if len(frame) >= min_bars:
+                valid_symbols.append(sym)
+
+        if not valid_symbols:
+            raise ValueError(
+                "После обработки не осталось тикеров, удовлетворяющих требованиям"
+            )
+
+        if set(valid_symbols) == set(active_symbols):
+            final = resampled.reset_index(drop=True)
+            break
+
+        active_symbols = valid_symbols
 
     numeric_cols = PRICE_COLS + VOL_COLS
-    values = combined[numeric_cols].to_numpy()
+    values = final[numeric_cols].to_numpy()
     if not np.isfinite(values).all():
         raise ValueError("Объединенный датафрейм содержит нечисловые значения после всех проверок")
 
-    return combined
+    return final
