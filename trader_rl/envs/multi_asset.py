@@ -173,9 +173,9 @@ class MultiAssetTradingEnv(Env):
             if "borrow_fee_bp_day" in group.columns:
                 self.borrow_fee_bp_ts[i] = group["borrow_fee_bp_day"].astype(float).values
 
-            close = self.closes[i]
-            high = self.highs[i]
-            low = self.lows[i]
+            close = np.clip(self.closes[i], 1e-6, None)
+            high = np.clip(self.highs[i], 1e-6, None)
+            low = np.clip(self.lows[i], 1e-6, None)
             volume = self.volumes[i]
 
             prev_close = np.clip(np.roll(close, 1), 1e-12, None)
@@ -232,12 +232,16 @@ class MultiAssetTradingEnv(Env):
         self.info_last: Dict[str, float] = {}
 
     def _midprice(self, t: int) -> np.ndarray:
-        return self.closes[:, t].astype(np.float64)
+        price = self.closes[:, t].astype(np.float64)
+        price = np.nan_to_num(price, nan=0.0, posinf=0.0, neginf=0.0)
+        price[price <= 0] = 1e-6
+        return price
 
     def _obs(self) -> Dict[str, np.ndarray]:
         t = self.t
         idx0 = t - self.T
         x_time = self.features[:, idx0:t, :].astype(np.float32)
+        x_time = np.nan_to_num(x_time, nan=0.0, posinf=0.0, neginf=0.0)
         prices = self._midprice(t)
         pos_value = self.qty * prices
         pos_fraction = pos_value / max(self.equity, 1e-12)
@@ -263,6 +267,7 @@ class MultiAssetTradingEnv(Env):
             ],
             axis=-1,
         )
+        x_pos = np.nan_to_num(x_pos, nan=0.0, posinf=0.0, neginf=0.0)
 
         gross = float(np.sum(np.abs(pos_value)))
         net = float(np.sum(pos_value))
@@ -274,6 +279,7 @@ class MultiAssetTradingEnv(Env):
             ],
             dtype=np.float32,
         )
+        g = np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {"time": x_time, "pos": x_pos.astype(np.float32), "global": g}
 
