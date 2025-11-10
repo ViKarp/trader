@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
 
 PRICE_COLS = ["open", "high", "low", "close"]
 VOL_COLS = ["volume"]
+RAW_REQUIRED_COLS = {"date", "open", "high", "low", "close", "volume"}
 
 
 def _resolve_file(directory: Path, symbol: str) -> Path:
@@ -36,6 +37,39 @@ def _resolve_file(directory: Path, symbol: str) -> Path:
     raise FileNotFoundError(
         f"Не найден файл с историческими данными для тикера '{symbol}' в '{directory}'"
     )
+
+
+def _validate_raw_frame(df: pd.DataFrame, symbol: str) -> None:
+    """Ensure the raw dataframe conforms to the expected Kaggle schema."""
+
+    lower = {c.lower(): c for c in df.columns}
+    missing = RAW_REQUIRED_COLS - set(lower)
+    if missing:
+        raise ValueError(
+            "У тикера '{}' отсутствуют необходимые колонки: {}".format(
+                symbol, ", ".join(sorted(missing))
+            )
+        )
+
+    date_col = lower["date"]
+    if df[date_col].isna().any():
+        raise ValueError(
+            f"В файле с тикером '{symbol}' есть пропуски в колонке даты."
+        )
+
+    duplicated = df[date_col].duplicated().sum()
+    if duplicated:
+        raise ValueError(
+            f"В файле для '{symbol}' найдено {duplicated} дублирующихся дат."
+        )
+
+    for name in RAW_REQUIRED_COLS - {"date"}:
+        col = lower[name]
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if numeric.isna().all():
+            raise ValueError(
+                f"Колонку '{col}' у '{symbol}' не удалось преобразовать в числовой формат."
+            )
 
 
 def _normalise_frame(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -109,6 +143,56 @@ def _resample(df: pd.DataFrame, freq: str, fill_method: str) -> pd.DataFrame:
     return df
 
 
+def _assert_valid_bars(df: pd.DataFrame, symbol: str, stage: str) -> None:
+    """Validate that the processed bars are finite and consistent."""
+
+    if df.empty:
+        raise ValueError(f"После этапа '{stage}' у тикера '{symbol}' не осталось строк")
+
+    if not df["timestamp"].is_monotonic_increasing:
+        raise ValueError(
+            f"На этапе '{stage}' временные метки у '{symbol}' неотсортированы по возрастанию"
+        )
+
+    duplicated = df["timestamp"].duplicated().sum()
+    if duplicated:
+        raise ValueError(
+            f"На этапе '{stage}' у '{symbol}' встречено {duplicated} дублирующихся временных меток"
+        )
+
+    numeric_cols: Iterable[str] = list(PRICE_COLS) + list(VOL_COLS)
+    values = df[numeric_cols].to_numpy()
+    if not np.isfinite(values).all():
+        bad_idx = np.where(~np.isfinite(values))
+        raise ValueError(
+            "На этапе '{}' у '{}' обнаружены нечисловые значения (пример: строка {}, колонка {}).".format(
+                stage, symbol, int(bad_idx[0][0]), numeric_cols[int(bad_idx[1][0])]
+            )
+        )
+
+    if (df[VOL_COLS] < 0).any().any():
+        raise ValueError(f"На этапе '{stage}' у '{symbol}' объемы не должны быть отрицательными")
+
+    if (df[PRICE_COLS] <= 0).any().any():
+        raise ValueError(
+            f"На этапе '{stage}' у '{symbol}' цены должны быть строго положительными"
+        )
+
+    if (df["high"] < df["low"]).any():
+        raise ValueError(f"На этапе '{stage}' у '{symbol}' high ниже low")
+
+    bad_open = (df["open"] > df["high"]) | (df["open"] < df["low"])
+    bad_close = (df["close"] > df["high"]) | (df["close"] < df["low"])
+    if bad_open.any():
+        raise ValueError(
+            f"На этапе '{stage}' у '{symbol}' значения open выходят за диапазон high/low"
+        )
+    if bad_close.any():
+        raise ValueError(
+            f"На этапе '{stage}' у '{symbol}' значения close выходят за диапазон high/low"
+        )
+
+
 def load_us_equities(
     root: Union[str, Path],
     symbols: Optional[Sequence[str]] = None,
@@ -161,7 +245,9 @@ def load_us_equities(
     for symbol in symbols:
         file_path = _resolve_file(directory, symbol)
         raw = pd.read_csv(file_path)
+        _validate_raw_frame(raw, symbol)
         normalised = _normalise_frame(raw, symbol)
+        _assert_valid_bars(normalised, symbol, stage="normalise")
         if start is not None:
             start_ts = pd.Timestamp(start, tz="UTC")
             normalised = normalised[normalised["timestamp"] >= start_ts]
@@ -173,6 +259,7 @@ def load_us_equities(
             continue
 
         resampled = _resample(normalised, freq=freq, fill_method=fill_method)
+        _assert_valid_bars(resampled, symbol, stage="resample")
         if len(resampled) < min_bars:
             continue
 
@@ -185,13 +272,12 @@ def load_us_equities(
     combined = pd.concat(frames, axis=0, ignore_index=True)
     combined = combined.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
-    values = combined[PRICE_COLS + VOL_COLS].to_numpy()
+    for sym, frame in combined.groupby("symbol", sort=False):
+        _assert_valid_bars(frame.reset_index(drop=True), symbol=sym, stage="final")
+
+    numeric_cols = PRICE_COLS + VOL_COLS
+    values = combined[numeric_cols].to_numpy()
     if not np.isfinite(values).all():
-        mask = np.isfinite(values).all(axis=1)
-        combined = combined.loc[mask].reset_index(drop=True)
-        if combined.empty:
-            raise ValueError(
-                "После очистки от нечисловых значений не осталось строк с данными"
-            )
+        raise ValueError("Объединенный датафрейм содержит нечисловые значения после всех проверок")
 
     return combined
