@@ -147,24 +147,27 @@ def load_us_equities(
     frames: List[pd.DataFrame] = []
     for symbol in symbols:
         file_path = _resolve_file(directory, symbol)
-        raw = pd.read_csv(file_path)
-        normalised = _normalise_frame(raw, symbol)
-        if start is not None:
-            start_ts = pd.Timestamp(start, tz="UTC")
-            normalised = normalised[normalised["timestamp"] >= start_ts]
-        if end is not None:
-            end_ts = pd.Timestamp(end, tz="UTC")
-            normalised = normalised[normalised["timestamp"] <= end_ts]
+        try:
+            raw = pd.read_csv(file_path)
+            normalised = _normalise_frame(raw, symbol)
+            if start is not None:
+                start_ts = pd.Timestamp(start, tz="UTC")
+                normalised = normalised[normalised["timestamp"] >= start_ts]
+            if end is not None:
+                end_ts = pd.Timestamp(end, tz="UTC")
+                normalised = normalised[normalised["timestamp"] <= end_ts]
 
-        if normalised.empty:
+            if normalised.empty:
+                continue
+
+            resampled = _resample(normalised, freq=freq, fill_method=fill_method)
+            if len(resampled) < min_bars:
+                continue
+
+            resampled["symbol"] = symbol
+            frames.append(resampled)
+        except:
             continue
-
-        resampled = _resample(normalised, freq=freq, fill_method=fill_method)
-        if len(resampled) < min_bars:
-            continue
-
-        resampled["symbol"] = symbol
-        frames.append(resampled)
 
     if not frames:
         raise ValueError("Не удалось загрузить ни одного символа из датасета")
