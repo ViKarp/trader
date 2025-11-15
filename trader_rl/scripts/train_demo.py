@@ -15,7 +15,12 @@ from trader_rl.utils import ExperimentLogger
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the demo PPO agent on synthetic data.")
-    parser.add_argument("--total-updates", type=int, default=30, help="Number of PPO updates to run")
+    parser.add_argument(
+        "--total-updates",
+        type=int,
+        default=None,
+        help="Number of PPO updates to run (default: cover full dataset once)",
+    )
     parser.add_argument(
         "--experiment-root",
         type=Path,
@@ -34,6 +39,13 @@ def main() -> None:
         help="Allow overwriting an existing experiment directory.",
     )
     parser.add_argument(
+        "--log-verbosity",
+        type=str,
+        default="all",
+        choices=("all", "updates"),
+        help="Console logging verbosity for experiment progress.",
+    )
+    parser.add_argument(
         "--initial-weights",
         type=Path,
         default=None,
@@ -45,6 +57,7 @@ def main() -> None:
         root_dir=args.experiment_root,
         name=args.experiment_name,
         overwrite=args.overwrite,
+        verbosity=args.log_verbosity,
     )
 
     data_path = "market_sample.csv"
@@ -64,14 +77,27 @@ def main() -> None:
 
     env = MultiAssetTradingEnv(df, symbols=symbols, cfg=cfg_env)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg_ppo = PPOConfig(device=device, rollout_steps=1_024, update_epochs=6, minibatch_size=128, lr=3e-4)
+    episode_steps = max(len(env.timestamps) - cfg_env.window_size - 1, 1)
+    cfg_ppo = PPOConfig(
+        device=device,
+        rollout_steps=episode_steps,
+        update_epochs=6,
+        minibatch_size=128,
+        lr=3e-4,
+    )
     ppo = PPOAgent(env, cfg_ppo, initial_weights=args.initial_weights)
 
     logger.log_message(f"Device: {device}")
     logger.log_config(env=cfg_env, ppo=cfg_ppo, symbols=symbols)
     logger.add_metadata(data_path=str(Path(data_path).resolve()))
+    logger.set_price_data(
+        symbols=symbols,
+        timestamps=[ts.isoformat() for ts in env.timestamps],
+        closes=env.closes,
+    )
 
-    ppo.train(total_updates=args.total_updates, log_fn=logger.log_update)
+    total_updates = args.total_updates if args.total_updates is not None else 1
+    ppo.train(total_updates=total_updates, log_fn=logger.log_update, step_log_fn=logger.log_step)
     logger.finalize(ppo)
 
 

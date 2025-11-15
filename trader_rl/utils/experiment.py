@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 
 class ExperimentLogger:
@@ -20,11 +21,14 @@ class ExperimentLogger:
     weights as artifacts.
     """
 
+    _VERBOSITY_LEVELS = {"all", "updates"}
+
     def __init__(
         self,
         root_dir: Optional[Path | str] = None,
         name: Optional[str] = None,
         overwrite: bool = False,
+        verbosity: str = "all",
     ) -> None:
         self.root_dir = Path(root_dir or "experiments")
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -58,9 +62,18 @@ class ExperimentLogger:
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
 
+        if verbosity not in self._VERBOSITY_LEVELS:
+            raise ValueError(
+                f"Unsupported verbosity '{verbosity}'. "
+                f"Choose from: {sorted(self._VERBOSITY_LEVELS)}"
+            )
+        self._verbosity = verbosity
+
         self._history: Dict[str, list[float]] = {}
         self._updates: list[int] = []
         self._metadata: Dict[str, Any] = {}
+        self._trades: list[Dict[str, Any]] = []
+        self._price_data: Optional[Dict[str, Any]] = None
 
         self.logger.info("Experiment directory: %s", self.experiment_dir.resolve())
 
@@ -87,6 +100,42 @@ class ExperimentLogger:
 
         self.logger.info(message)
 
+    def set_price_data(
+        self,
+        *,
+        symbols: Iterable[str],
+        timestamps: Iterable[str],
+        closes: Iterable[Iterable[float]],
+    ) -> None:
+        """Provide historical price data for plotting trade timelines."""
+
+        self._price_data = {
+            "symbols": list(symbols),
+            "timestamps": list(timestamps),
+            "closes": [list(series) for series in closes],
+        }
+
+    def log_step(self, event: Mapping[str, Any]) -> None:
+        """Log detailed information about a single trading action."""
+
+        symbol = event.get("symbol", "?")
+        side = event.get("side", "?")
+        qty = float(event.get("qty", 0.0))
+        price = float(event.get("price", float("nan")))
+        position = float(event.get("position", 0.0))
+        target = float(event.get("target_fraction", 0.0))
+        equity = float(event.get("equity", float("nan")))
+        timestamp = event.get("timestamp", "?")
+        step_idx = event.get("step", None)
+        prefix = f"Step {step_idx:06d} | " if step_idx is not None else ""
+        message = (
+            f"{prefix}{timestamp} | {symbol} {side} qty={qty:.4f} "
+            f"price={price:.4f} pos={position:.4f} target={target:.4f} equity={equity:.2f}"
+        )
+        if self._verbosity == "all":
+            self.logger.info(message)
+        self._trades.append({k: self._convert(v) for k, v in event.items()})
+
     # ------------------------------------------------------------------
     # Metrics collection
     def log_update(self, update: int, metrics: Mapping[str, Any]) -> None:
@@ -112,6 +161,7 @@ class ExperimentLogger:
 
         self._dump_history()
         self._plot_equity_curve()
+        self._plot_trade_charts()
         self._dump_metadata()
         if agent is not None and hasattr(agent, "save_weights"):
             weights_path = self.experiment_dir / "model_weights.pt"
@@ -165,6 +215,77 @@ class ExperimentLogger:
         fig.savefig(plot_path)
         plt.close(fig)
         self.logger.info("Saved equity plot to %s", plot_path.name)
+
+    def _plot_trade_charts(self) -> None:
+        if not self._price_data or not self._trades:
+            return
+
+        symbols = self._price_data["symbols"]
+        timestamps = self._price_data["timestamps"]
+        closes = self._price_data["closes"]
+        if not symbols or not timestamps:
+            return
+
+        parsed_ts = [datetime.fromisoformat(ts) for ts in timestamps]
+        dates = mdates.date2num(parsed_ts)
+
+        trades_by_symbol: Dict[str, list[Dict[str, Any]]] = {symbol: [] for symbol in symbols}
+        for trade in self._trades:
+            sym = trade.get("symbol")
+            if sym in trades_by_symbol:
+                trades_by_symbol[sym].append(trade)
+
+        for idx, symbol in enumerate(symbols):
+            price_series = closes[idx] if idx < len(closes) else None
+            if price_series is None:
+                continue
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot_date(dates, price_series, "-", linewidth=1.2, label="Close")
+
+            buy_plotted = False
+            sell_plotted = False
+            for trade in trades_by_symbol[symbol]:
+                try:
+                    dt = datetime.fromisoformat(str(trade.get("timestamp")))
+                    ts_num = mdates.date2num(dt)
+                    price = float(trade.get("price", float("nan")))
+                    side = str(trade.get("side", "")).upper()
+                    qty = float(trade.get("qty", 0.0))
+                except Exception:
+                    continue
+                if not side or price != price:
+                    continue
+                color = "green" if side == "BUY" else "red"
+                marker = "^" if side == "BUY" else "v"
+                label = None
+                if side == "BUY" and not buy_plotted:
+                    label = "Buy"
+                    buy_plotted = True
+                elif side == "SELL" and not sell_plotted:
+                    label = "Sell"
+                    sell_plotted = True
+                ax.scatter(ts_num, price, color=color, marker=marker, s=60, label=label)
+                ax.annotate(
+                    f"{side[0]} {qty:.2f}",
+                    (ts_num, price),
+                    textcoords="offset points",
+                    xytext=(0, 6 if side == "BUY" else -10),
+                    ha="center",
+                    fontsize=8,
+                    color=color,
+                )
+
+            ax.set_title(f"{symbol} trades")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Price")
+            ax.grid(True, linestyle="--", alpha=0.4)
+            ax.legend(loc="best")
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            plot_path = self.experiment_dir / f"{symbol.lower()}_trades.png"
+            fig.savefig(plot_path)
+            plt.close(fig)
+            self.logger.info("Saved trade plot to %s", plot_path.name)
 
     def _dump_metadata(self) -> None:
         if not self._metadata:
